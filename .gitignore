@@ -1,0 +1,19 @@
+# Fichiers secrets — jamais sur Git
+.env
+
+# Données téléchargées
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# VS Code
+.vscode/
+
+# Fichiers Excel téléchargés
+*.xlsx
+*.xls

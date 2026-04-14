@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS produits_homologues (
+    id                    SERIAL PRIMARY KEY,
+    nom_commercial        TEXT NOT NULL,
+    detenteur             TEXT,
+    fournisseur           TEXT,
+    numero_homologation   TEXT,
+    valable_jusqu_au      DATE,
+    tableau_toxicologique TEXT,
+    categorie             TEXT,
+    formulation           TEXT,
+    matiere_active        TEXT,
+    teneur                TEXT,
+    usage                 TEXT,
+    dose                  TEXT,
+    culture               TEXT,
+    dar                   TEXT,
+    nb_applications       TEXT,
+    statut                TEXT DEFAULT 'Homologué',
+    created_at            TIMESTAMP DEFAULT NOW(),
+    updated_at            TIMESTAMP DEFAULT NOW(),
+    UNIQUE(nom_commercial, culture, usage)
+);

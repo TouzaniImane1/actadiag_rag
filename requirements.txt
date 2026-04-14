@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pandas
+openpyxl
+requests
+beautifulsoup4
+psycopg2-binary
+openai
+python-dotenv
+sqlalchemy
+httpx
+pgvector
