@@ -1,291 +1,239 @@
 """
-Étapes 1 & 2 du pipeline :
-- Surveille l'URL ONSSA
-- Télécharge le fichier Excel si changement détecté
+Pipeline ONSSA — Téléchargement automatique avec Selenium
+Télécharge 3 fichiers :
+  1. Index Phytosanitaire (4686 produits)
+  2. Changement de dose   (section ln2Rech6)
+  3. Changement de DAR    (section ln2Rech7)
 """
-import hashlib
-import os
-import requests
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from db.connection import execute_query
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+import time, os, shutil, gzip, hashlib
 
-load_dotenv()
-
-ONSSA_URL = os.getenv(
-    "ONSSA_URL",
-    "https://eservice.onssa.gov.ma/IndPesticide.aspx"
+ONSSA_URL = "https://eservice.onssa.gov.ma/IndPesticide.aspx"
+MODIF_URL = "https://eservice.onssa.gov.ma/ModifHomolog.aspx"
+DOSSIER = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "data")
 )
-
-URL_MODIF = "https://eservice.onssa.gov.ma/ModifHomolog.aspx"
-
-# IDs exacts trouvés par inspection du site ONSSA
-SECTIONS_MODIFICATIONS = {
-    "modif_toutes"           : "ctl00$CPHCorps$lnkModifHomolog",
-    "second_nom_commercial"  : "ctl00$CPHCorps$ln2Rech1",
-    "transfert_homologation" : "ctl00$CPHCorps$ln2Rech2",
-    "extension_usage"        : "ctl00$CPHCorps$ln2Rech3",
-    "extension_usage_mineur" : "ctl00$CPHCorps$ln2Rech4",
-    "changement_appellation" : "ctl00$CPHCorps$ln2Rech5",
-    "changement_dose"        : "ctl00$CPHCorps$ln2Rech6",
-    "changement_dar"         : "ctl00$CPHCorps$ln2Rech7",
-    "changement_fournisseur" : "ctl00$CPHCorps$ln2Rech8",
-    "retrait_homologation"   : "ctl00$CPHCorps$ln2Rech9",
+SECTIONS = {
+    "changement_dose": {
+        "id_lien"    : "ctl00_CPHCorps_ln2Rech6",
+        "nom_fichier": "onssa_changement_dose"
+    },
+    "changement_dar": {
+        "id_lien"    : "ctl00_CPHCorps_ln2Rech7",
+        "nom_fichier": "onssa_changement_dar"
+    },
 }
 
-# Sections critiques à traiter en priorité
-SECTIONS_CRITIQUES = [
-    "retrait_homologation",   # produit interdit → statut = Retiré
-    "changement_dose",        # dose modifiée    → mettre à jour dose
-    "changement_dar",         # DAR modifié      → mettre à jour delai_avant_recolte
-    "extension_usage",        # nouvelle culture → nouveau chunk RAG
-]
-
-def get_last_hash():
-    """Récupère le dernier hash connu depuis sync_log."""
-    result = execute_query("""
-        SELECT hash_fichier FROM sync_log
-        WHERE source = 'ONSSA' AND statut = 'success'
-        ORDER BY date_sync DESC
-        LIMIT 1
-    """, fetch=True)
-    return result[0]["hash_fichier"] if result else None
-
-def telecharger_fichier():
-    """
-    Télécharge le fichier Excel ONSSA via POST ASP.NET.
-    Retourne (contenu_bytes, hash_sha256) ou (None, None) si pas de changement.
-    """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+def configurer_driver():
+    os.makedirs(DOSSIER, exist_ok=True)
+    options = webdriver.ChromeOptions()
+    options.add_experimental_option("prefs", {
+        "download.default_directory"  : DOSSIER,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade"  : True,
+        "safebrowsing.enabled"        : True
     })
+    # Décommenter en production sur VM Debian :
+    # options.add_argument("--headless")
+    # options.add_argument("--no-sandbox")
+    # options.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options
+    )
+    return driver
 
-    # Étape 1 — Charger la page pour récupérer les tokens ASP.NET
-    print("Chargement de la page ONSSA...")
-    response = session.get(ONSSA_URL, timeout=30)
-    soup = BeautifulSoup(response.text, "html.parser")
+def nettoyer_dossier():
+    os.makedirs(DOSSIER, exist_ok=True)
+    for f in os.listdir(DOSSIER):
+        if f.endswith((".gz", ".xls", ".xlsx")):
+            os.remove(os.path.join(DOSSIER, f))
+            print(f"  Supprimé : {f}")
 
-    viewstate = soup.find("input", {"id": "__VIEWSTATE"})
-    eventvalidation = soup.find("input", {"id": "__EVENTVALIDATION"})
+def attendre_nouveau_fichier(fichiers_avant, timeout=120):
+    print("  Attente téléchargement...")
+    debut = time.time()
+    while time.time() - debut < timeout:
+        fichiers_apres = set(
+            f for f in os.listdir(DOSSIER)
+            if f.endswith((".gz", ".xls", ".xlsx"))
+            and not f.endswith(".crdownload")
+        )
+        nouveaux = fichiers_apres - fichiers_avant
+        if nouveaux:
+            time.sleep(2)
+            return os.path.join(DOSSIER, list(nouveaux)[0])
+        time.sleep(1)
+    return None
 
-    if not viewstate or not eventvalidation:
-        raise ValueError("Tokens ASP.NET introuvables sur la page ONSSA.")
+def decompresser(chemin_gz):
+    if not chemin_gz.endswith(".gz"):
+        return chemin_gz
+    chemin_xls = chemin_gz[:-3]
+    with gzip.open(chemin_gz, 'rb') as f_in:
+        with open(chemin_xls, 'wb') as f_out:
+            f_out.write(f_in.read())
+    os.remove(chemin_gz)
+    print(f"  Décompressé : {os.path.basename(chemin_xls)}")
+    return chemin_xls
 
-    # Étape 2 — Lancer la Recherche Multicritère (Tous les produits)
-    print("Lancement Recherche Multicritère...")
-    data_filtre = {
-        "__VIEWSTATE"      : viewstate["value"],
-        "__EVENTVALIDATION": eventvalidation["value"],
-        "ctl00$CPHCorps$ddlMatiereActive": "Tous",
-        "ctl00$CPHCorps$ddlUsage"        : "Tous",
-        "ctl00$CPHCorps$ddlCulture"      : "Tous",
-        "ctl00$CPHCorps$btnFiltrer"      : "Filtrer",
-    }
-    response2 = session.post(ONSSA_URL, data=data_filtre, timeout=60)
-    soup2 = BeautifulSoup(response2.text, "html.parser")
+def calculer_hash(chemin):
+    with open(chemin, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
-    viewstate2 = soup2.find("input", {"id": "__VIEWSTATE"})
-    eventvalidation2 = soup2.find("input", {"id": "__EVENTVALIDATION"})
+def telecharger_index_phytosanitaire(driver, wait):
+    print("\n" + "="*50)
+    print("TÉLÉCHARGEMENT 1/3 : Index Phytosanitaire")
+    print("="*50)
 
-    # Étape 3 — Cliquer sur le bouton Excel
-    print("Téléchargement du fichier Excel...")
-    data_excel = {
-        "__VIEWSTATE"         : viewstate2["value"],
-        "__EVENTVALIDATION"   : eventvalidation2["value"],
-        "ctl00$CPHCorps$epp.x": "10",
-        "ctl00$CPHCorps$epp.y": "10",
-    }
-    excel_response = session.post(ONSSA_URL, data=data_excel, timeout=120)
-    contenu = excel_response.content
+    fichiers_avant = set(
+        f for f in os.listdir(DOSSIER)
+        if f.endswith((".gz", ".xls", ".xlsx"))
+    )
 
-    # Calculer le hash SHA-256
-    hash_actuel = hashlib.sha256(contenu).hexdigest()
+    driver.get(ONSSA_URL)
+    time.sleep(2)
+    print(f"  Page ouverte : {driver.title}")
 
-    # Comparer avec le dernier hash connu
-    hash_connu = get_last_hash()
-    if hash_actuel == hash_connu:
-        print("Pas de changement détecté — aucune mise à jour nécessaire.")
+    print("  Clic Recherche Multicritère...")
+    wait.until(EC.element_to_be_clickable(
+        (By.ID, "ctl00_CPHCorps_lnkrech9")
+    )).click()
+    time.sleep(3)
+
+    print("  Clic Rechercher...")
+    wait.until(EC.element_to_be_clickable(
+        (By.NAME, "ctl00$CPHCorps$nfBtn")
+    )).click()
+    print("  Chargement des 4686 produits (~15 sec)...")
+    time.sleep(15)
+
+    print("  Clic bouton Excel...")
+    wait.until(EC.element_to_be_clickable(
+        (By.NAME, "ctl00$CPHCorps$epp")
+    )).click()
+
+    chemin = attendre_nouveau_fichier(fichiers_avant)
+    if not chemin:
+        print("  ERREUR : Téléchargement échoué !")
         return None, None
 
-    print(f"Nouveau fichier détecté ! Hash : {hash_actuel[:16]}...")
-    return contenu, hash_actuel
+    print(f"  Reçu : {os.path.basename(chemin)}")
+    if chemin.endswith(".gz"):
+        chemin = decompresser(chemin)
 
-def sauvegarder_fichier(contenu, chemin="data/onssa_complet.xlsx"):
-    """Sauvegarde le contenu binaire dans un fichier Excel."""
-    os.makedirs("data", exist_ok=True)
-    with open(chemin, "wb") as f:
-        f.write(contenu)
-    print(f"Fichier sauvegardé : {chemin} ({len(contenu):,} octets)")
-    return chemin
+    final = os.path.join(DOSSIER, "onssa_index_phyto.xls")
+    if os.path.exists(final):
+        os.remove(final)
+    shutil.move(chemin, final)
 
-def get_last_hash():
-    """Récupère le dernier hash connu depuis sync_log."""
-    result = execute_query("""
-        SELECT hash_fichier FROM sync_log
-        WHERE source = 'ONSSA' AND statut = 'success'
-        ORDER BY date_sync DESC
-        LIMIT 1
-    """, fetch=True)
-    return result[0]["hash_fichier"] if result else None
+    hash_fichier = calculer_hash(final)
+    print(f"  Sauvegardé : onssa_index_phyto.xls ✓")
+    print(f"  Taille     : {os.path.getsize(final):,} octets")
+    print(f"  Hash       : {hash_fichier[:16]}...")
+    return final, hash_fichier
 
-def get_tokens(session, url):
-    """Charge une page et retourne les tokens ASP.NET."""
-    response = session.get(url, timeout=30)
-    soup = BeautifulSoup(response.text, "html.parser")
-    viewstate = soup.find("input", {"id": "__VIEWSTATE"})
-    eventvalidation = soup.find(
-        "input", {"id": "__EVENTVALIDATION"}
+def telecharger_section_modification(driver, wait, nom_section, config):
+    print(f"\n{'='*50}")
+    print(f"TÉLÉCHARGEMENT : {nom_section}")
+    print("="*50)
+
+    fichiers_avant = set(
+        f for f in os.listdir(DOSSIER)
+        if f.endswith((".gz", ".xls", ".xlsx"))
     )
-    if not viewstate or not eventvalidation:
-        raise ValueError(f"Tokens ASP.NET introuvables : {url}")
-    return viewstate["value"], eventvalidation["value"]
 
-def telecharger_excel_indpesticide():
-    """
-    Télécharge l'Index Phytosanitaire complet via Multicritère.
-    Retourne (contenu_bytes, hash) ou (None, None) si pas de changement.
-    """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    })
+    driver.get(MODIF_URL)
+    time.sleep(2)
 
-    print("Téléchargement Index Phytosanitaire ONSSA...")
-    viewstate, eventvalidation = get_tokens(session, ONSSA_URL)
+    print(f"  Clic section {nom_section}...")
+    wait.until(EC.element_to_be_clickable(
+        (By.ID, config["id_lien"])
+    )).click()
+    time.sleep(3)
 
-    # Filtrer avec Multicritère — tout sélectionner
-    data_filtre = {
-        "__VIEWSTATE"      : viewstate,
-        "__EVENTVALIDATION": eventvalidation,
-        "ctl00$CPHCorps$ddlMatiereActive": "Tous",
-        "ctl00$CPHCorps$ddlUsage"        : "Tous",
-        "ctl00$CPHCorps$ddlCulture"      : "Tous",
-        "ctl00$CPHCorps$btnFiltrer"      : "Filtrer",
-    }
-    response2 = session.post(ONSSA_URL, data=data_filtre, timeout=60)
-    soup2 = BeautifulSoup(response2.text, "html.parser")
+    print("  Clic bouton Excel...")
+    wait.until(EC.element_to_be_clickable(
+        (By.NAME, "ctl00$CPHCorps$epp")
+    )).click()
 
-    viewstate2 = soup2.find("input", {"id": "__VIEWSTATE"})["value"]
-    eventvalidation2 = soup2.find(
-        "input", {"id": "__EVENTVALIDATION"})["value"]
-
-    # Cliquer sur le bouton Excel
-    data_excel = {
-        "__VIEWSTATE"         : viewstate2,
-        "__EVENTVALIDATION"   : eventvalidation2,
-        "ctl00$CPHCorps$epp.x": "10",
-        "ctl00$CPHCorps$epp.y": "10",
-    }
-    excel_response = session.post(
-        ONSSA_URL, data=data_excel, timeout=120
-    )
-    contenu = excel_response.content
-    hash_actuel = hashlib.sha256(contenu).hexdigest()
-
-    # Vérifier si changement
-    hash_connu = get_last_hash()
-    if hash_actuel == hash_connu:
-        print("Index Phytosanitaire — pas de changement.")
+    chemin = attendre_nouveau_fichier(fichiers_avant)
+    if not chemin:
+        print("  ERREUR : Téléchargement échoué !")
         return None, None
 
-    print(f"Nouveau fichier détecté ! Hash : {hash_actuel[:16]}...")
-    return contenu, hash_actuel
+    print(f"  Reçu : {os.path.basename(chemin)}")
+    if chemin.endswith(".gz"):
+        chemin = decompresser(chemin)
 
-def telecharger_section_modification(nom_section):
+    nom_final = f"{config['nom_fichier']}.xls"
+    final = os.path.join(DOSSIER, nom_final)
+    if os.path.exists(final):
+        os.remove(final)
+    shutil.move(chemin, final)
+
+    hash_fichier = calculer_hash(final)
+    print(f"  Sauvegardé : {nom_final} ✓")
+    print(f"  Taille     : {os.path.getsize(final):,} octets")
+    print(f"  Hash       : {hash_fichier[:16]}...")
+    return final, hash_fichier
+
+def telecharger_tout():
     """
-    Télécharge une section spécifique de Modifications/Retraits.
-    Utilise les IDs exacts trouvés par inspection du site.
+    Télécharge automatiquement les 3 fichiers ONSSA.
+    Appelée par run_pipeline.py chaque lundi via cron.
     """
-    if nom_section not in SECTIONS_MODIFICATIONS:
-        raise ValueError(f"Section inconnue : {nom_section}")
+    print("DÉMARRAGE TÉLÉCHARGEMENT ONSSA COMPLET")
+    print(f"Dossier : {DOSSIER}")
+    print(f"Heure   : {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    eventtarget = SECTIONS_MODIFICATIONS[nom_section]
-
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    })
-
-    print(f"Téléchargement section : {nom_section}...")
-
-    # Charger la page principale
-    viewstate, eventvalidation = get_tokens(session, URL_MODIF)
-
-    # Cliquer sur le lien de la section
-    data_section = {
-        "__VIEWSTATE"      : viewstate,
-        "__EVENTVALIDATION": eventvalidation,
-        "__EVENTTARGET"    : eventtarget,
-        "__EVENTARGUMENT"  : "",
-    }
-    response2 = session.post(URL_MODIF, data=data_section, timeout=30)
-    soup2 = BeautifulSoup(response2.text, "html.parser")
-
-    viewstate2 = soup2.find("input", {"id": "__VIEWSTATE"})["value"]
-    eventvalidation2 = soup2.find(
-        "input", {"id": "__EVENTVALIDATION"})["value"]
-
-    # Cliquer sur le bouton Excel
-    data_excel = {
-        "__VIEWSTATE"         : viewstate2,
-        "__EVENTVALIDATION"   : eventvalidation2,
-        "ctl00$CPHCorps$epp.x": "10",
-        "ctl00$CPHCorps$epp.y": "10",
-    }
-    excel_response = session.post(
-        URL_MODIF, data=data_excel, timeout=60
-    )
-    contenu = excel_response.content
-    hash_actuel = hashlib.sha256(contenu).hexdigest()
-
-    print(f"  ✓ {nom_section} : {len(contenu):,} octets")
-    return contenu, hash_actuel
-
-def telecharger_toutes_modifications():
-    """
-    Télécharge toutes les sections de modifications.
-    Priorité aux sections critiques.
-    """
-    os.makedirs("data", exist_ok=True)
+    nettoyer_dossier()
+    driver   = configurer_driver()
+    wait     = WebDriverWait(driver, 30)
     resultats = {}
 
-    # D'abord les sections critiques
-    sections_ordonnees = (
-        SECTIONS_CRITIQUES +
-        [s for s in SECTIONS_MODIFICATIONS
-         if s not in SECTIONS_CRITIQUES]
-    )
+    try:
+        chemin, hash_f = telecharger_index_phytosanitaire(driver, wait)
+        resultats["index_phyto"] = {
+            "chemin": chemin,
+            "hash"  : hash_f,
+            "statut": "success" if chemin else "error"
+        }
 
-    for nom_section in sections_ordonnees:
-        try:
-            contenu, hash_fichier = telecharger_section_modification(
-                nom_section
+        for nom_section, config in SECTIONS.items():
+            chemin, hash_f = telecharger_section_modification(
+                driver, wait, nom_section, config
             )
-            chemin = f"data/modif_{nom_section}.xlsx"
-            with open(chemin, "wb") as f:
-                f.write(contenu)
-
             resultats[nom_section] = {
-                "chemin"     : chemin,
-                "hash"       : hash_fichier,
-                "taille"     : len(contenu),
-                "statut"     : "success"
+                "chemin": chemin,
+                "hash"  : hash_f,
+                "statut": "success" if chemin else "error"
             }
 
-        except Exception as e:
-            print(f"  ✗ Erreur {nom_section} : {e}")
-            resultats[nom_section] = {
-                "statut": "error",
-                "erreur": str(e)
-            }
+    except Exception as e:
+        print(f"\nERREUR : {e}")
+        import traceback
+        traceback.print_exc()
+
+    finally:
+        driver.quit()
+        print("\nNavigateur fermé ✓")
+
+    print("\n" + "="*50)
+    print("RÉSUMÉ TÉLÉCHARGEMENT")
+    print("="*50)
+    for nom, info in resultats.items():
+        statut = "✓" if info["statut"] == "success" else "✗"
+        chemin = info.get("chemin")
+        nom_f  = os.path.basename(chemin) if chemin else "ÉCHEC"
+        print(f"  {statut} {nom:25} → {nom_f}")
 
     return resultats
 
-def sauvegarder_fichier(contenu, chemin="data/onssa_complet.xlsx"):
-    """Sauvegarde le contenu binaire dans un fichier Excel."""
-    os.makedirs("data", exist_ok=True)
-    with open(chemin, "wb") as f:
-        f.write(contenu)
-    print(f"Fichier sauvegardé : {chemin} ({len(contenu):,} octets)")
-    return chemin
+if __name__ == "__main__":
+    telecharger_tout()
