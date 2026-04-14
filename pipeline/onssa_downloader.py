@@ -86,6 +86,27 @@ def calculer_hash(chemin):
     with open(chemin, 'rb') as f:
         return hashlib.sha256(f.read()).hexdigest()
 
+def cliquer_bouton_excel(wait):
+    """
+    Attend que l'overlay disparaisse puis clique sur Excel.
+    Robuste contre les délais de chargement du site ONSSA.
+    """
+    # Attendre que le WaitProgressOverLayer disparaisse
+    print("  Attente disparition overlay...")
+    try:
+        wait.until(EC.invisibility_of_element_located(
+            (By.CSS_SELECTOR, "div.WaitProgressOverLayer")
+        ))
+        print("  Overlay disparu ✓")
+    except Exception:
+        print("  Pas d'overlay détecté ✓")
+
+    # Clic bouton Excel
+    print("  Clic bouton Excel...")
+    wait.until(EC.element_to_be_clickable(
+        (By.NAME, "ctl00$CPHCorps$epp")
+    )).click()
+
 def telecharger_index_phytosanitaire(driver, wait):
     print("\n" + "="*50)
     print("TÉLÉCHARGEMENT 1/3 : Index Phytosanitaire")
@@ -110,13 +131,11 @@ def telecharger_index_phytosanitaire(driver, wait):
     wait.until(EC.element_to_be_clickable(
         (By.NAME, "ctl00$CPHCorps$nfBtn")
     )).click()
-    print("  Chargement des 4686 produits (~15 sec)...")
-    time.sleep(15)
+    print("  Chargement des 4686 produits (~25 sec)...")
+    time.sleep(25)
 
-    print("  Clic bouton Excel...")
-    wait.until(EC.element_to_be_clickable(
-        (By.NAME, "ctl00$CPHCorps$epp")
-    )).click()
+    # Attendre overlay + cliquer Excel
+    cliquer_bouton_excel(wait)
 
     chemin = attendre_nouveau_fichier(fichiers_avant)
     if not chemin:
@@ -138,7 +157,9 @@ def telecharger_index_phytosanitaire(driver, wait):
     print(f"  Hash       : {hash_fichier[:16]}...")
     return final, hash_fichier
 
-def telecharger_section_modification(driver, wait, nom_section, config):
+def telecharger_section_modification(
+    driver, wait, nom_section, config
+):
     print(f"\n{'='*50}")
     print(f"TÉLÉCHARGEMENT : {nom_section}")
     print("="*50)
@@ -157,10 +178,8 @@ def telecharger_section_modification(driver, wait, nom_section, config):
     )).click()
     time.sleep(3)
 
-    print("  Clic bouton Excel...")
-    wait.until(EC.element_to_be_clickable(
-        (By.NAME, "ctl00$CPHCorps$epp")
-    )).click()
+    # Attendre overlay + cliquer Excel
+    cliquer_bouton_excel(wait)
 
     chemin = attendre_nouveau_fichier(fichiers_avant)
     if not chemin:
@@ -194,11 +213,13 @@ def telecharger_tout():
 
     nettoyer_dossier()
     driver   = configurer_driver()
-    wait     = WebDriverWait(driver, 30)
+    wait     = WebDriverWait(driver, 60)
     resultats = {}
 
     try:
-        chemin, hash_f = telecharger_index_phytosanitaire(driver, wait)
+        chemin, hash_f = telecharger_index_phytosanitaire(
+            driver, wait
+        )
         resultats["index_phyto"] = {
             "chemin": chemin,
             "hash"  : hash_f,

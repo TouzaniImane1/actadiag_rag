@@ -2,6 +2,7 @@
 Étape 5 — Génération des embeddings
 Convertit chaque produit en vecteur numérique
 et le stocke dans rag_chunks.
+Mode delta : génère uniquement les chunks manquants.
 """
 import sys
 import os
@@ -11,13 +12,8 @@ sys.path.append(
 
 from dotenv import load_dotenv
 from db.connection import get_connection
-import openai
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-MODELE_EMBEDDING = "text-embedding-3-small"
-DIMENSION        = 1536
 
 def construire_chunk_produit(row):
     """
@@ -77,12 +73,14 @@ def generer_embedding(texte):
     )
     return response.json()["embedding"]
 
-def stocker_chunk(cur, source, culture, texte, vecteur, metadata):
+def stocker_chunk(cur, source, culture, texte,
+                  vecteur, metadata):
     """Insère un chunk dans rag_chunks."""
     import json
     cur.execute("""
         INSERT INTO rag_chunks
-            (source, culture, contenu_texte, embedding, metadata)
+            (source, culture, contenu_texte,
+             embedding, metadata)
         VALUES (%s, %s, %s, %s::vector, %s)
     """, (
         source,
@@ -94,7 +92,9 @@ def stocker_chunk(cur, source, culture, texte, vecteur, metadata):
 
 def generer_embeddings_produits():
     """
-    Génère les embeddings pour tous les produits homologués.
+    Génère les embeddings UNIQUEMENT pour les produits
+    qui n'ont pas encore de chunk dans rag_chunks.
+    Mode delta — ne retraite pas ce qui existe déjà.
     """
     print("\n" + "="*50)
     print("EMBEDDINGS : produits_homologues")
@@ -104,23 +104,31 @@ def generer_embeddings_produits():
     nb   = 0
 
     try:
-        # Récupérer tous les produits
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM produits_homologues")
+            # Seulement les produits sans chunk existant
+            cur.execute("""
+                SELECT p.*
+                FROM produits_homologues p
+                LEFT JOIN rag_chunks r
+                    ON r.metadata->>'nom_commercial'
+                       = p.nom_commercial
+                    AND r.source = 'ONSSA'
+                WHERE r.id IS NULL
+            """)
             produits = cur.fetchall()
+
+        if not produits:
+            print("  Aucun nouveau produit à vectoriser ✓")
+            return 0
 
         print(f"  {len(produits)} produits à vectoriser...")
 
         with conn:
             with conn.cursor() as cur:
                 for produit in produits:
-                    # Construire le texte
-                    texte = construire_chunk_produit(produit)
-
-                    # Générer le vecteur
+                    texte   = construire_chunk_produit(produit)
                     vecteur = generer_embedding(texte)
 
-                    # Stocker dans rag_chunks
                     stocker_chunk(
                         cur,
                         source   = "ONSSA",
@@ -128,18 +136,27 @@ def generer_embeddings_produits():
                         texte    = texte,
                         vecteur  = vecteur,
                         metadata = {
-                            "type"              : "produit_homologue",
-                            "nom_commercial"    : produit.get("nom_commercial"),
-                            "categorie"         : produit.get("categorie"),
-                            "numero_homologation": produit.get("numero_homologation"),
+                            "type": "produit_homologue",
+                            "nom_commercial": produit.get(
+                                "nom_commercial"
+                            ),
+                            "categorie": produit.get(
+                                "categorie"
+                            ),
+                            "numero_homologation": produit.get(
+                                "numero_homologation"
+                            ),
                         }
                     )
                     nb += 1
 
                     if nb % 100 == 0:
-                        print(f"  {nb}/{len(produits)} embeddings générés...")
+                        print(
+                            f"  {nb}/{len(produits)} "
+                            f"embeddings générés..."
+                        )
 
-        print(f"  Embeddings produits terminés : {nb} chunks ✓")
+        print(f"  Embeddings produits : {nb} nouveaux chunks ✓")
         return nb
 
     except Exception as e:
@@ -150,7 +167,9 @@ def generer_embeddings_produits():
 
 def generer_embeddings_changements():
     """
-    Génère les embeddings pour les changements dose/DAR.
+    Génère les embeddings UNIQUEMENT pour les changements
+    qui n'ont pas encore de chunk dans rag_chunks.
+    Mode delta — ne retraite pas ce qui existe déjà.
     """
     print(f"\n{'='*50}")
     print("EMBEDDINGS : changements_dose_dar")
@@ -161,15 +180,29 @@ def generer_embeddings_changements():
 
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM changements_dose_dar")
+            # Seulement les changements sans chunk existant
+            cur.execute("""
+                SELECT c.*
+                FROM changements_dose_dar c
+                LEFT JOIN rag_chunks r
+                    ON r.metadata->>'produit' = c.produit
+                    AND r.source = 'ONSSA_MODIF'
+                    AND r.metadata->>'type_changement'
+                        = c.type_changement
+                WHERE r.id IS NULL
+            """)
             changements = cur.fetchall()
+
+        if not changements:
+            print("  Aucun nouveau changement à vectoriser ✓")
+            return 0
 
         print(f"  {len(changements)} changements à vectoriser...")
 
         with conn:
             with conn.cursor() as cur:
                 for ch in changements:
-                    texte = construire_chunk_changement(ch)
+                    texte   = construire_chunk_changement(ch)
                     vecteur = generer_embedding(texte)
 
                     stocker_chunk(
@@ -180,13 +213,17 @@ def generer_embeddings_changements():
                         vecteur  = vecteur,
                         metadata = {
                             "type"           : "changement",
-                            "type_changement": ch.get("type_changement"),
+                            "type_changement": ch.get(
+                                "type_changement"
+                            ),
                             "produit"        : ch.get("produit"),
                         }
                     )
                     nb += 1
 
-        print(f"  Embeddings changements terminés : {nb} chunks ✓")
+        print(
+            f"  Embeddings changements : {nb} nouveaux chunks ✓"
+        )
         return nb
 
     except Exception as e:
@@ -197,19 +234,12 @@ def generer_embeddings_changements():
 
 def generer_tous_embeddings():
     """
-    Génère tous les embeddings et remplit rag_chunks.
+    Génère uniquement les embeddings manquants.
+    Ne vide PAS rag_chunks — mode delta uniquement.
     """
     print("="*50)
-    print("ÉTAPE 5 — GÉNÉRATION EMBEDDINGS")
+    print("ÉTAPE 5 — GÉNÉRATION EMBEDDINGS (delta)")
     print("="*50)
-
-    # Vider rag_chunks avant de regénérer
-    conn = get_connection()
-    with conn:
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE rag_chunks")
-    conn.close()
-    print("  Table rag_chunks vidée ✓")
 
     nb_produits    = generer_embeddings_produits()
     nb_changements = generer_embeddings_changements()
@@ -220,7 +250,7 @@ def generer_tous_embeddings():
     print("="*50)
     print(f"  ✓ Produits    → {nb_produits} chunks")
     print(f"  ✓ Changements → {nb_changements} chunks")
-    print(f"  ✓ Total       → {total} chunks dans rag_chunks")
+    print(f"  ✓ Total       → {total} nouveaux chunks")
 
     return total
 
