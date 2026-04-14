@@ -1,5 +1,5 @@
 """
-Test de connexion Python vers PostgreSQL actadiag_rag
+Test de Python vers PostgreSQL actadiag_rag
 """
 import psycopg2
 from dotenv import load_dotenv
