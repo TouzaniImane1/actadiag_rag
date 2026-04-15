@@ -55,15 +55,24 @@ def mettre_a_jour_hash(source, nouveau_hash):
 
 def hash_dataframe(df):
     """
-    Hash le contenu réel d'un DataFrame.
-    Trie les lignes pour garantir un hash stable
-    même si l'ordre des lignes change entre
-    deux téléchargements.
+    Hash uniquement les numéros d'homologation triés.
+    C'est la donnée la plus stable du site ONSSA.
+    Change UNIQUEMENT si de nouveaux produits apparaissent.
     """
-    df_trie = df.sort_values(
-        by=["nom_commercial", "culture", "usage"]
-    ).reset_index(drop=True)
-    contenu = df_trie.to_csv(index=False).encode()
+    if "numero_homologation" not in df.columns:
+        # Fallback sur toutes les colonnes clés
+        colonnes = ["nom_commercial", "culture", "usage"]
+        df_trie = df[colonnes].fillna("").sort_values(
+            by=colonnes
+        ).reset_index(drop=True)
+        contenu = df_trie.to_csv(index=False).encode()
+        return hashlib.sha256(contenu).hexdigest()
+
+    # Hash stable basé sur les numéros d'homologation
+    numeros = sorted(
+        df["numero_homologation"].fillna("").tolist()
+    )
+    contenu = "|".join(numeros).encode()
     return hashlib.sha256(contenu).hexdigest()
 
 def verifier_hash(source, nouveau_hash):
