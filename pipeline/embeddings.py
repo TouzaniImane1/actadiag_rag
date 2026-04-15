@@ -1,8 +1,13 @@
 """
 Étape 5 — Génération des embeddings
-Convertit chaque produit en vecteur numérique
+Convertit chaque produit/changement en vecteur numérique
 et le stocke dans rag_chunks.
-Mode delta : génère uniquement les chunks manquants.
+Mode delta intelligent :
+  - Nouveaux produits     → embedding généré
+  - Produits modifiés     → embedding régénéré
+  - Changements nouveaux  → embedding généré
+  - Changements modifiés  → embedding régénéré
+  - Inchangés             → rien
 """
 import sys
 import os
@@ -16,10 +21,7 @@ from db.connection import get_connection
 load_dotenv()
 
 def construire_chunk_produit(row):
-    """
-    Construit le texte descriptif d'un produit.
-    C'est ce texte qui sera converti en vecteur.
-    """
+    """Construit le texte descriptif d'un produit."""
     return f"""Produit phytosanitaire homologué ONSSA au Maroc.
 Nom commercial : {row.get('nom_commercial', '')}
 Catégorie : {row.get('categorie', '')}
@@ -35,9 +37,7 @@ Numéro homologation : {row.get('numero_homologation', '')}
 Statut : Homologué ONSSA""".strip()
 
 def construire_chunk_changement(row):
-    """
-    Construit le texte descriptif d'un changement dose/DAR.
-    """
+    """Construit le texte descriptif d'un changement dose/DAR."""
     type_ch = row.get('type_changement', '')
 
     if type_ch == 'dose':
@@ -91,11 +91,6 @@ def stocker_chunk(cur, source, culture, texte,
     ))
 
 def generer_embeddings_produits():
-    """
-    Génère les embeddings UNIQUEMENT pour les produits
-    qui n'ont pas encore de chunk dans rag_chunks.
-    Mode delta — ne retraite pas ce qui existe déjà.
-    """
     print("\n" + "="*50)
     print("EMBEDDINGS : produits_homologues")
     print("="*50)
@@ -105,20 +100,22 @@ def generer_embeddings_produits():
 
     try:
         with conn.cursor() as cur:
-            # Seulement les produits sans chunk existant
+            # Utiliser DISTINCT ON pour éviter les doublons
             cur.execute("""
                 SELECT p.*
                 FROM produits_homologues p
-                LEFT JOIN rag_chunks r
-                    ON r.metadata->>'nom_commercial'
-                       = p.nom_commercial
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM rag_chunks r
+                    WHERE r.metadata->>'nom_commercial'
+                          = p.nom_commercial
                     AND r.source = 'ONSSA'
-                WHERE r.id IS NULL
+                    AND r.created_at >= p.updated_at
+                )
             """)
             produits = cur.fetchall()
 
         if not produits:
-            print("  Aucun nouveau produit à vectoriser ✓")
+            print("  Aucun produit nouveau ou modifié ✓")
             return 0
 
         print(f"  {len(produits)} produits à vectoriser...")
@@ -129,6 +126,14 @@ def generer_embeddings_produits():
                     texte   = construire_chunk_produit(produit)
                     vecteur = generer_embedding(texte)
 
+                    # Supprimer l'ancien chunk si existe
+                    cur.execute("""
+                        DELETE FROM rag_chunks
+                        WHERE source = 'ONSSA'
+                        AND metadata->>'nom_commercial' = %s
+                    """, (produit.get("nom_commercial"),))
+
+                    # Insérer le nouveau chunk
                     stocker_chunk(
                         cur,
                         source   = "ONSSA",
@@ -156,23 +161,23 @@ def generer_embeddings_produits():
                             f"embeddings générés..."
                         )
 
-        print(f"  Embeddings produits : {nb} nouveaux chunks ✓")
+        print(f"  Embeddings produits : {nb} chunks ✓")
         return nb
 
     except Exception as e:
-        print(f"  ERREUR embeddings produits : {e}")
+        print(f"  ERREUR : {e}")
         raise
     finally:
         conn.close()
 
-def generer_embeddings_changements():
+def generer_embeddings_changements_dose():
     """
-    Génère les embeddings UNIQUEMENT pour les changements
-    qui n'ont pas encore de chunk dans rag_chunks.
-    Mode delta — ne retraite pas ce qui existe déjà.
+    Génère les embeddings pour les changements de DOSE :
+    - Nouveaux changements (jamais dans rag_chunks)
+    - Changements modifiés (updated_at > chunk created_at)
     """
     print(f"\n{'='*50}")
-    print("EMBEDDINGS : changements_dose_dar")
+    print("EMBEDDINGS : changements dose")
     print("="*50)
 
     conn = get_connection()
@@ -180,24 +185,28 @@ def generer_embeddings_changements():
 
     try:
         with conn.cursor() as cur:
-            # Seulement les changements sans chunk existant
             cur.execute("""
                 SELECT c.*
                 FROM changements_dose_dar c
                 LEFT JOIN rag_chunks r
                     ON r.metadata->>'produit' = c.produit
-                    AND r.source = 'ONSSA_MODIF'
-                    AND r.metadata->>'type_changement'
-                        = c.type_changement
-                WHERE r.id IS NULL
+                    AND r.source = 'ONSSA_DOSE'
+                    AND r.metadata->>'no_homologation'
+                        = c.no_homologation
+                WHERE c.type_changement = 'dose'
+                AND (
+                    r.id IS NULL
+                    OR r.created_at < c.created_at
+                )
             """)
             changements = cur.fetchall()
 
         if not changements:
-            print("  Aucun nouveau changement à vectoriser ✓")
+            print("  Aucun changement dose nouveau ou modifié ✓")
             return 0
 
-        print(f"  {len(changements)} changements à vectoriser...")
+        print(f"  {len(changements)} changements dose "
+              f"à vectoriser...")
 
         with conn:
             with conn.cursor() as cur:
@@ -205,52 +214,150 @@ def generer_embeddings_changements():
                     texte   = construire_chunk_changement(ch)
                     vecteur = generer_embedding(texte)
 
+                    # Supprimer l'ancien chunk si existe
+                    cur.execute("""
+                        DELETE FROM rag_chunks
+                        WHERE source = 'ONSSA_DOSE'
+                        AND metadata->>'produit' = %s
+                        AND metadata->>'no_homologation' = %s
+                    """, (
+                        ch.get("produit"),
+                        ch.get("no_homologation")
+                    ))
+
+                    # Insérer le nouveau chunk
                     stocker_chunk(
                         cur,
-                        source   = "ONSSA_MODIF",
+                        source   = "ONSSA_DOSE",
                         culture  = None,
                         texte    = texte,
                         vecteur  = vecteur,
                         metadata = {
-                            "type"           : "changement",
-                            "type_changement": ch.get(
-                                "type_changement"
-                            ),
+                            "type"           : "changement_dose",
+                            "type_changement": "dose",
                             "produit"        : ch.get("produit"),
+                            "no_homologation": ch.get(
+                                "no_homologation"
+                            ),
                         }
                     )
                     nb += 1
 
-        print(
-            f"  Embeddings changements : {nb} nouveaux chunks ✓"
-        )
+        print(f"  Embeddings dose : {nb} chunks ✓")
         return nb
 
     except Exception as e:
-        print(f"  ERREUR embeddings changements : {e}")
+        print(f"  ERREUR embeddings dose : {e}")
+        raise
+    finally:
+        conn.close()
+
+def generer_embeddings_changements_dar():
+    """
+    Génère les embeddings pour les changements de DAR :
+    - Nouveaux changements (jamais dans rag_chunks)
+    - Changements modifiés (updated_at > chunk created_at)
+    """
+    print(f"\n{'='*50}")
+    print("EMBEDDINGS : changements DAR")
+    print("="*50)
+
+    conn = get_connection()
+    nb   = 0
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.*
+                FROM changements_dose_dar c
+                LEFT JOIN rag_chunks r
+                    ON r.metadata->>'produit' = c.produit
+                    AND r.source = 'ONSSA_DAR'
+                    AND r.metadata->>'no_homologation'
+                        = c.no_homologation
+                WHERE c.type_changement = 'dar'
+                AND (
+                    r.id IS NULL
+                    OR r.created_at < c.created_at
+                )
+            """)
+            changements = cur.fetchall()
+
+        if not changements:
+            print("  Aucun changement DAR nouveau ou modifié ✓")
+            return 0
+
+        print(f"  {len(changements)} changements DAR "
+              f"à vectoriser...")
+
+        with conn:
+            with conn.cursor() as cur:
+                for ch in changements:
+                    texte   = construire_chunk_changement(ch)
+                    vecteur = generer_embedding(texte)
+
+                    # Supprimer l'ancien chunk si existe
+                    cur.execute("""
+                        DELETE FROM rag_chunks
+                        WHERE source = 'ONSSA_DAR'
+                        AND metadata->>'produit' = %s
+                        AND metadata->>'no_homologation' = %s
+                    """, (
+                        ch.get("produit"),
+                        ch.get("no_homologation")
+                    ))
+
+                    # Insérer le nouveau chunk
+                    stocker_chunk(
+                        cur,
+                        source   = "ONSSA_DAR",
+                        culture  = None,
+                        texte    = texte,
+                        vecteur  = vecteur,
+                        metadata = {
+                            "type"           : "changement_dar",
+                            "type_changement": "dar",
+                            "produit"        : ch.get("produit"),
+                            "no_homologation": ch.get(
+                                "no_homologation"
+                            ),
+                        }
+                    )
+                    nb += 1
+
+        print(f"  Embeddings DAR : {nb} chunks ✓")
+        return nb
+
+    except Exception as e:
+        print(f"  ERREUR embeddings DAR : {e}")
         raise
     finally:
         conn.close()
 
 def generer_tous_embeddings():
     """
-    Génère uniquement les embeddings manquants.
-    Ne vide PAS rag_chunks — mode delta uniquement.
+    Génère uniquement les embeddings manquants ou obsolètes.
+    Couvre les 3 sources :
+      1. Index Phytosanitaire (produits_homologues)
+      2. Changements de dose  (changements_dose_dar)
+      3. Changements de DAR   (changements_dose_dar)
     """
     print("="*50)
     print("ÉTAPE 5 — GÉNÉRATION EMBEDDINGS (delta)")
     print("="*50)
 
-    nb_produits    = generer_embeddings_produits()
-    nb_changements = generer_embeddings_changements()
-    total          = nb_produits + nb_changements
+    nb_produits = generer_embeddings_produits()
+    nb_dose     = generer_embeddings_changements_dose()
+    nb_dar      = generer_embeddings_changements_dar()
+    total       = nb_produits + nb_dose + nb_dar
 
     print("\n" + "="*50)
     print("RÉSUMÉ EMBEDDINGS")
     print("="*50)
-    print(f"  ✓ Produits    → {nb_produits} chunks")
-    print(f"  ✓ Changements → {nb_changements} chunks")
-    print(f"  ✓ Total       → {total} nouveaux chunks")
+    print(f"  ✓ Produits homologués → {nb_produits} chunks")
+    print(f"  ✓ Changements dose    → {nb_dose} chunks")
+    print(f"  ✓ Changements DAR     → {nb_dar} chunks")
+    print(f"  ✓ Total               → {total} nouveaux chunks")
 
     return total
 
